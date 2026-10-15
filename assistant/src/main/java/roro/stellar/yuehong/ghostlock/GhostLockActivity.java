@@ -2,6 +2,7 @@ package roro.stellar.yuehong.ghostlock;
 
 import roro.stellar.yuehong.R;
 import roro.stellar.yuehong.shell.GhostLockOtaApi;
+import roro.stellar.yuehong.shell.KernelSuManagerSelection;
 
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
@@ -39,7 +40,6 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
-import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -54,7 +54,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -75,7 +74,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -91,8 +89,8 @@ public class GhostLockActivity extends ComponentActivity {
     private static final String TAG = "GhostLockApp";
     private static final String BINARY_NAME = "libghostlock.so";
     private static final String EXTRACT_NAME = "libextract.so";
-    private static final String KSU_ACTIVATION_ASSET = "yhroot_ksu_activate.sh";
-    private static final String KSU_ACTIVATION_SCRIPT = ".ghostlock_root.sh";
+    private static final String ACTIVATION_SCRIPT = ".ghostlock_activation.sh";
+    private static final String ACTIVATION_STATUS = ".ghostlock_activation.status";
     private static final String OFFSETS_JSON = "offsets.json";
     private static final int REQ_IMPORT_OFFSETS = 1001;
     private static final int REQ_PICK_BOOT = 1002;
@@ -100,12 +98,10 @@ public class GhostLockActivity extends ComponentActivity {
     private static final String PREFS = "ghostlock_prefs";
     private static final String PREF_CPU_PAIR = "cpu_pair";
     private static final String PREF_BUILTIN_OFFSET_STATUS = "builtin_offset_status";
-    private static final String PREF_DYNAMIC_PAYLOAD_STATUS = "dynamic_payload_status";
     private static final String STATUS_FAILED_PREFIX = "failed:";
     private static final String STATUS_SUCCESS_PREFIX = "success:";
-    private static final String DYNAMIC_DIR = "ksuroot";
     private static final int MAX_NATIVE_ATTEMPTS = 2;
-    private static final int EXIT_KSU_ACTIVATION_FAILED = 2;
+    private static final int EXIT_ACTIVATION_FAILED = 2;
     private static final long NATIVE_RETRY_DELAY_MS = 1500L;
     private static final int COLOR_RED = 0xFFFF6B6B;
     private static final int COLOR_GREEN = 0xFF5FD68A;
@@ -126,9 +122,6 @@ public class GhostLockActivity extends ComponentActivity {
     private Button copyButton;
     private Button autoRootButton;
     private EditText otaUrlInput;
-    private RadioGroup strategyGroup;
-    private File dynamicBaseLibrary;
-    private String dynamicBaselineId = "IONSTACK-P10-CP2A.260605.012";
     private GhostLockOtaApi ghostLockOtaApi;
     private View rootView;
     private int cpuPairIndex;
@@ -466,7 +459,6 @@ public class GhostLockActivity extends ComponentActivity {
         copyButton = findViewById(R.id.copyButton);
         autoRootButton = findViewById(R.id.autoRootButton);
         otaUrlInput = findViewById(R.id.otaUrlInput);
-        strategyGroup = findViewById(R.id.strategyGroup);
         ghostLockOtaApi = new GhostLockOtaApi(this);
 
         applyWindowInsetsPadding();
@@ -483,22 +475,7 @@ public class GhostLockActivity extends ComponentActivity {
     }
 
     private void startSelectedPrivilege() {
-        if (isDynamicMode()) startAutomaticDynamicPrivilege(); else startAutomaticPrivilege();
-    }
-
-    private boolean isDynamicMode() {
-        return strategyGroup.getCheckedRadioButtonId() == R.id.strategyDynamic;
-    }
-
-    private String preferredDynamicPayloadName() {
-        boolean vivo = Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("vivo")
-                || Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("iqoo")
-                || getSystemProperty("ro.vivo.os.name").length() > 0;
-        return vivo ? "libbs.so" : "libionstack.so";
-    }
-
-    private String dynamicPayloadToken() {
-        return System.getProperty("os.version", "") + "|" + preferredDynamicPayloadName();
+        startAutomaticPrivilege();
     }
 
     private boolean isBuiltinOffsetBlocked(String kernelRelease) {
@@ -519,195 +496,8 @@ public class GhostLockActivity extends ComponentActivity {
                 .commit();
     }
 
-    private boolean isBuiltinDynamicBlocked(String token) {
-        String status = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getString(PREF_DYNAMIC_PAYLOAD_STATUS, "");
-        return (STATUS_FAILED_PREFIX + token).equals(status);
-    }
-
-    private void markBuiltinDynamicFailed(String token) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putString(PREF_DYNAMIC_PAYLOAD_STATUS, STATUS_FAILED_PREFIX + token)
-                .commit();
-    }
-
-    private void markBuiltinDynamicSuccess(String token) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putString(PREF_DYNAMIC_PAYLOAD_STATUS, STATUS_SUCCESS_PREFIX + token)
-                .commit();
-    }
-
-    private File selectPreferredDynamicPayload() throws IOException {
-        String library = preferredDynamicPayloadName();
-        boolean vivo = "libbs.so".equals(library);
-        File payload = new File(getApplicationInfo().nativeLibraryDir, library);
-        if (!payload.isFile() || !isElf64(payload)) throw new IOException("missing bundled dynamic payload: " + library);
-        dynamicBaseLibrary = payload;
-        dynamicBaselineId = vivo ? "PD2520-BP2A.250605.031.A3" : "IONSTACK-P10-CP2A.260605.012";
-        appendLog("[KSuRoot] selected bundled payload: " + library);
-        return payload;
-    }
-
-    private int runDynamicPayload(File selected) throws IOException, InterruptedException {
-        if (!isElf64(selected)) throw new IOException("dynamic payload is not ELF64");
-        File dir = new File(getFilesDir(), DYNAMIC_DIR);
-        if (!dir.exists() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
-        File payload = new File(dir, "run-payload.so");
-        copyFile(selected, payload);
-        File helperSource = new File(getApplicationInfo().nativeLibraryDir, "libcve43499root.so");
-        if (!helperSource.isFile()) throw new IOException("missing helper: " + helperSource);
-        // nativeLibraryDir is extracted by the package manager with execute
-        // permission. App-private files/ksuroot may be mounted noexec, so do
-        // not copy the helper there and do not chmod a private-directory copy.
-        File helper = helperSource;
-        appendLog("[KSuRoot] helper: " + helper.getAbsolutePath());
-        File log = new File(dir, "exploit.log");
-        if (log.isFile()) log.delete();
-        ProcessBuilder pb = new ProcessBuilder(helper.getAbsolutePath(), "--run-payload", payload.getAbsolutePath(), helper.getAbsolutePath(), log.getAbsolutePath());
-        pb.directory(dir);
-        pb.redirectErrorStream(true);
-        pb.environment().put("EXPLOIT_ATTEMPTS", "24");
-        pb.environment().put("P0_ATTEMPT_TIMEOUT_SEC", "45");
-        pb.environment().put("EXPLOIT_ATTEMPT_TIMEOUT_SEC", "120");
-        int code = runProcess(pb, 900);
-        if (log.isFile()) appendLog(logText(log));
-        appendLog("[KSuRoot] payload exit code=" + code);
-        return code;
-    }
-
-    private void startAutomaticDynamicPrivilege() {
-        if (running.get() || !automaticFlowRunning.compareAndSet(false, true)) return;
-        setRunState(RunState.RUNNING);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        final String dynamicToken = dynamicPayloadToken();
-        if (isBuiltinDynamicBlocked(dynamicToken)) {
-            appendLog("[KSuRoot] bundled payload was not confirmed successful previously; skipping it and continuing to OTA analysis");
-            requestAutomaticDynamicOta();
-            return;
-        }
-        markBuiltinDynamicFailed(dynamicToken);
-        worker.execute(() -> {
-            int code = 1;
-            try {
-                appendLog("[KSuRoot] detecting bundled payload");
-                code = runDynamicPayload(selectPreferredDynamicPayload());
-            } catch (Throwable e) {
-                appendLog("[KSuRoot] bundled payload failed: " + e.getMessage());
-            }
-            final int finalCode = code;
-            ui.post(() -> {
-                if (finalCode == 0) {
-                    markBuiltinDynamicSuccess(dynamicToken);
-                    automaticFlowRunning.set(false);
-                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    setRunState(RunState.SUCCESS);
-                } else {
-                    appendLog("[KSuRoot] bundled payload failed; continuing to OTA analysis without trying another payload");
-                    requestAutomaticDynamicOta();
-                }
-            });
-        });
-    }
-
-    private void requestAutomaticDynamicOta() {
-        String explicit = otaUrlInput.getText().toString().trim();
-        if (!explicit.isEmpty()) {
-            if (!isValidOtaUrl(explicit)) {
-                automaticFlowRunning.set(false);
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                setRunState(RunState.FAILED);
-                toast(R.string.ghostlock_parse_failed_url);
-                return;
-            }
-            appendLog("[KSuRoot] using supplied OTA URL");
-            runDynamicOtaFlow(explicit);
-            return;
-        }
-        appendLog("[KSuRoot] requesting current full OTA through protocol v2");
-        ghostLockOtaApi.resolve(result -> {
-            if (!result.getSuccessful()) {
-                automaticFlowRunning.set(false);
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                setRunState(RunState.FAILED);
-                appendLog("[KSuRoot] ROM V2 error: " + result.getErrorMessage());
-                toast(R.string.ghostlock_auto_ota_failed);
-                return;
-            }
-            otaUrlInput.setText(result.getOtaUrl());
-            appendLog("[KSuRoot] ROM V2 provider=" + result.getProvider());
-            runDynamicOtaFlow(result.getOtaUrl());
-        });
-    }
-
-    private void runDynamicOtaFlow(String otaUrl) {
-        worker.execute(() -> {
-            int code = 1;
-            try {
-                File dir = new File(getFilesDir(), DYNAMIC_DIR);
-                if (!dir.exists() && !dir.mkdirs()) throw new IOException("cannot create " + dir);
-                File binary = new File(getApplicationInfo().nativeLibraryDir, EXTRACT_NAME);
-                List<String> args = new ArrayList<>();
-                args.add(otaUrl);
-                args.add("--format"); args.add("json");
-                args.add("--out"); args.add(new File(dir, "ota-offsets.tmp").getAbsolutePath());
-                args.add("--work-dir"); args.add(dir.getAbsolutePath());
-                appendLog("[KSuRoot] extracting boot from OTA");
-                code = runExtractProcess(binary, args, dir);
-                if (code != 0) throw new IOException("OTA extraction exit code=" + code);
-                File boot = latestExtractedBoot(dir);
-                if (boot == null) throw new IOException("extracted boot.img was not found");
-                appendLog("[KSuRoot] building payload from " + boot.getAbsolutePath());
-                File base = dynamicBaseLibrary;
-                if (base == null || !base.isFile()) base = selectPreferredDynamicPayload();
-                DynamicBuildResult result = DynamicPayloadEngine.build(java.nio.file.Files.readAllBytes(boot.toPath()), java.nio.file.Files.readAllBytes(base.toPath()), dynamicBaselineId, line -> appendLog("[KSuRoot] " + line));
-                if (result.getPayload() == null) throw new IOException(result.getSummary());
-                File built = new File(dir, "payload-patched.so");
-                try (FileOutputStream output = new FileOutputStream(built, false)) { output.write(result.getPayload()); }
-                appendLog(result.getSummary());
-                if (!result.getWarnings().isEmpty()) appendLog("[KSuRoot] warning: " + result.getWarnings());
-                code = runDynamicPayload(built);
-            } catch (Throwable e) {
-                appendLog("[KSuRoot] OTA fallback failed: " + e.getMessage());
-            }
-            final int finalCode = code;
-            ui.post(() -> {
-                automaticFlowRunning.set(false);
-                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                setRunState(finalCode == 0 ? RunState.SUCCESS : RunState.FAILED);
-            });
-        });
-    }
-
-    private File latestExtractedBoot(File dir) {
-        File[] entries = dir.listFiles();
-        if (entries == null) return null;
-        File selected = null;
-        for (File entry : entries) {
-            if (!entry.isDirectory() || !entry.getName().startsWith("ghostlock-payload-")) continue;
-            File[] boots = entry.listFiles((parent, name) -> name.equals("boot") || name.equals("boot.img"));
-            if (boots != null && boots.length > 0 && (selected == null || boots[0].lastModified() > selected.lastModified())) selected = boots[0];
-        }
-        return selected;
-    }
-
     private boolean isValidOtaUrl(String value) { return value.startsWith("https://") || value.startsWith("http://"); }
 
-    private boolean isElf64(File file) {
-        try (InputStream in = new FileInputStream(file)) {
-            byte[] h = new byte[5];
-            return in.read(h) == h.length && h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F' && h[4] == 2;
-        } catch (IOException e) { return false; }
-    }
-
-    private void copyFile(File source, File target) throws IOException {
-        if (source == null || !source.isFile()) throw new IOException("file missing: " + source);
-        try (InputStream in = new FileInputStream(source); OutputStream out = new FileOutputStream(target, false)) { copyStream(in, out); }
-    }
-
-    private String logText(File file) {
-        try { return new String(java.nio.file.Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8); }
-        catch (IOException e) { return ""; }
-    }
     @Override
     public void onBackPressed() {
         finish();
@@ -1380,6 +1170,8 @@ public class GhostLockActivity extends ComponentActivity {
         pb.directory(workDir);
         pb.redirectErrorStream(true);
         pb.environment().put("GHOSTLOCK_HOME", workDir.getAbsolutePath());
+        pb.environment().put("GHOSTLOCK_ACTIVATION_SCRIPT",
+                new File(workDir, ACTIVATION_SCRIPT).getAbsolutePath());
         pb.environment().put("TMPDIR", workDir.getAbsolutePath());
         pb.environment().put("HOME", workDir.getAbsolutePath());
         // Payload downloads and on-device analysis can take a while.
@@ -1483,9 +1275,9 @@ public class GhostLockActivity extends ComponentActivity {
         throw new IOException("missing native binary: " + packaged.getAbsolutePath());
     }
 
-    private File prepareKsuActivationScript(File workDir) throws IOException {
-        File out = new File(workDir, KSU_ACTIVATION_SCRIPT);
-        try (InputStream in = getAssets().open(KSU_ACTIVATION_ASSET);
+    private File prepareActivationScript(File workDir) throws IOException {
+        File out = new File(workDir, ACTIVATION_SCRIPT);
+        try (InputStream in = getAssets().open("yhroot_ksu_activate.sh");
              OutputStream output = new FileOutputStream(out, false)) {
             copyStream(in, output);
         }
@@ -1502,6 +1294,11 @@ public class GhostLockActivity extends ComponentActivity {
         pb.directory(workDir);
         pb.redirectErrorStream(true);
         pb.environment().put("GHOSTLOCK_HOME", workDir.getAbsolutePath());
+        pb.environment().put("GHOSTLOCK_ACTIVATION_SCRIPT",
+                new File(workDir, ACTIVATION_SCRIPT).getAbsolutePath());
+        String managerPackage = KernelSuManagerSelection.INSTANCE.selectedPackage(this);
+        pb.environment().put("YHROOT_KSU_PACKAGE", managerPackage);
+        appendLog("selected KernelSU manager package: " + managerPackage);
         pb.environment().put("TMPDIR", workDir.getAbsolutePath());
         pb.environment().put("HOME", workDir.getAbsolutePath());
         pb.environment().put("YHROOT_CLEANUP_DELAY", "5");
@@ -1523,10 +1320,14 @@ public class GhostLockActivity extends ComponentActivity {
         for (int attempt = 1; attempt <= MAX_NATIVE_ATTEMPTS; attempt++) {
             File activationLog = new File(workDir, ".ghostlock_ksu.log");
             if (activationLog.isFile() && !activationLog.delete()) {
-                appendLog("warning: stale KernelSU activation log could not be removed");
+                appendLog("warning: stale activation log could not be removed");
             }
-            File activationScript = prepareKsuActivationScript(workDir);
-            appendLog("shared KernelSU activation script ready: " + activationScript.getName());
+            File activationStatus = new File(workDir, ACTIVATION_STATUS);
+            if (activationStatus.isFile() && !activationStatus.delete()) {
+                appendLog("warning: stale activation status could not be removed");
+            }
+            File activationScript = prepareActivationScript(workDir);
+            appendLog("selected KernelSU activation script ready: " + activationScript.getName());
             appendLog("native attempt " + attempt + "/" + MAX_NATIVE_ATTEMPTS);
             code = runBinary(binary, workDir);
             if (code == 0) {
@@ -1539,7 +1340,7 @@ public class GhostLockActivity extends ComponentActivity {
                     + "; retrying in a fresh process");
             Thread.sleep(NATIVE_RETRY_DELAY_MS);
         }
-        if (code == EXIT_KSU_ACTIVATION_FAILED) {
+        if (code == EXIT_ACTIVATION_FAILED) {
             appendLog("KernelSU activation did not complete; result is not marked successful");
         }
         return code;

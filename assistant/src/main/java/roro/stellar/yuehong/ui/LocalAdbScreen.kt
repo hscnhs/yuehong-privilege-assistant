@@ -36,13 +36,13 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
@@ -67,6 +67,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
@@ -77,8 +78,8 @@ import androidx.compose.ui.unit.dp
 import roro.stellar.yuehong.R
 import roro.stellar.yuehong.shell.EscalationResult
 import roro.stellar.yuehong.shell.EscalationStage
-import roro.stellar.yuehong.shell.DeviceProfile
-import roro.stellar.yuehong.shell.DeviceProfileUploadResult
+import roro.stellar.yuehong.shell.BundledPayload
+import roro.stellar.yuehong.shell.BundledPayloadCatalog
 import roro.stellar.yuehong.shell.OutputLine
 import roro.stellar.yuehong.shell.PrivilegeEscalator
 import roro.stellar.yuehong.shell.StellarShellController
@@ -100,8 +101,13 @@ fun LocalAdbScreen(
     var command by rememberSaveable { mutableStateOf("") }
     var localPrivilegeCommand by rememberSaveable { mutableStateOf("") }
     var pendingLocalPayloadUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    var showPayloadPicker by remember { mutableStateOf(false) }
     var showEscalationResult by remember { mutableStateOf(false) }
-    val listState = rememberLazyListState()
+    val context = LocalContext.current
+    val bundledPayloads = remember(context) {
+        runCatching { BundledPayloadCatalog.load(context) }.getOrDefault(emptyList())
+    }
+    val terminalScrollState = rememberScrollState()
     val escalationRunning = escalator.stage !in setOf(EscalationStage.Idle, EscalationStage.Done)
     val localPayloadPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -118,7 +124,7 @@ fun LocalAdbScreen(
 
     LaunchedEffect(controller.output.size) {
         if (controller.output.isNotEmpty()) {
-            listState.animateScrollToItem(controller.output.lastIndex)
+            runCatching { terminalScrollState.animateScrollTo(terminalScrollState.maxValue) }
         }
     }
 
@@ -153,14 +159,14 @@ fun LocalAdbScreen(
             EscalationCard(
                 escalator = escalator,
                 enabled = !controller.isRunning && controller.status == StellarStatus.Granted,
-                onStart = escalator::start,
+                onSelectBundledPayload = { showPayloadPicker = true },
                 onSelectLocalPayload = { localPayloadPicker.launch(arrayOf("*/*")) },
                 compact = embedded,
             )
             TerminalOutputCard(
                 modifier = Modifier.weight(1f),
                 output = controller.output,
-                listState = listState,
+                scrollState = terminalScrollState,
                 canClear = !controller.isRunning && !escalationRunning,
                 onClear = controller::clear,
             )
@@ -193,14 +199,24 @@ fun LocalAdbScreen(
         )
     }
 
+    if (showPayloadPicker) {
+        BundledPayloadDialog(
+            payloads = bundledPayloads,
+            onSelect = {
+                showPayloadPicker = false
+                escalator.startWithBundledPayload(it)
+            },
+            onDismiss = { showPayloadPicker = false },
+        )
+    }
+
     if (showEscalationResult) {
         EscalationResultDialog(
             result = escalator.result,
-            onActivateKernelSu = {
+            onActivateJailbreak = {
                 showEscalationResult = false
-                escalator.activateKernelSu()
+                escalator.activateJailbreak()
             },
-            onUploadDeviceProfile = escalator::uploadUnsupportedProfile,
             onDismiss = {
                 showEscalationResult = false
                 escalator.reset()
@@ -284,13 +300,13 @@ private fun LocalAdbHeader(
 private fun EscalationCard(
     escalator: PrivilegeEscalator,
     enabled: Boolean,
-    onStart: () -> Unit,
+    onSelectBundledPayload: () -> Unit,
     onSelectLocalPayload: () -> Unit,
     compact: Boolean,
 ) {
     val running = escalator.stage !in setOf(EscalationStage.Idle, EscalationStage.Done)
     val failed = escalator.result is EscalationResult.Failure ||
-        escalator.result is EscalationResult.KernelSuActivationFailure
+        escalator.result is EscalationResult.JailbreakActivationFailure
     val accent by animateColorAsState(
         targetValue = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
         label = "escalation-accent",
@@ -369,7 +385,7 @@ private fun EscalationCard(
                 MotionButton(
                     modifier = Modifier.weight(1f),
                     enabled = enabled && !running,
-                    onClick = onStart,
+                    onClick = onSelectBundledPayload,
                 ) {
                     AnimatedContent(
                         targetState = running,
@@ -423,6 +439,70 @@ private fun EscalationCard(
 }
 
 @Composable
+fun BundledPayloadDialog(
+    payloads: List<BundledPayload>,
+    onSelect: (BundledPayload) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val filtered = payloads.filter { payload ->
+        query.isBlank() ||
+            payload.displayName.contains(query, ignoreCase = true) ||
+            payload.library.contains(query, ignoreCase = true) ||
+            payload.vendor.contains(query, ignoreCase = true) ||
+            payload.kernelVersion.orEmpty().contains(query, ignoreCase = true)
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.bundled_payload_dialog_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    modifier = Modifier.fillMaxWidth(),
+                    value = query,
+                    onValueChange = { query = it },
+                    singleLine = true,
+                    label = { Text(stringResource(R.string.bundled_payload_search)) },
+                )
+                Text(
+                    text = stringResource(R.string.bundled_payload_count, filtered.size),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 0.dp, max = 520.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    items(filtered) { payload ->
+                        TextButton(
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = { onSelect(payload) },
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                Text(
+                                    text = payload.label,
+                                    fontFamily = FontFamily.Monospace,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Start,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
 fun LocalPayloadCommandDialog(
     command: String,
     onCommandChange: (String) -> Unit,
@@ -434,7 +514,9 @@ fun LocalPayloadCommandDialog(
         title = { Text(stringResource(R.string.local_payload_command_dialog_title)) },
         text = {
             LazyColumn(
-                modifier = Modifier.heightIn(max = 520.dp),
+                modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 0.dp, max = 520.dp),
                 verticalArrangement = Arrangement.spacedBy(9.dp),
             ) {
                 item {
@@ -493,7 +575,7 @@ fun LocalPayloadCommandDialog(
 @Composable
 private fun TerminalOutputCard(
     output: List<OutputLine>,
-    listState: androidx.compose.foundation.lazy.LazyListState,
+    scrollState: androidx.compose.foundation.ScrollState,
     canClear: Boolean,
     onClear: () -> Unit,
     modifier: Modifier = Modifier,
@@ -579,17 +661,14 @@ private fun TerminalOutputCard(
                     }
                 } else {
                     SelectionContainer {
-                        LazyColumn(
+                        Column(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .verticalScroll(scrollState)
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
-                            state = listState,
                             verticalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
-                            itemsIndexed(
-                                items = output,
-                                key = { index, line -> "$index-${line.text.hashCode()}" },
-                            ) { _, line ->
+                            output.forEach { line ->
                                 Text(
                                     text = line.text,
                                     style = MaterialTheme.typography.bodyMedium.copy(
@@ -705,97 +784,39 @@ private fun CommandComposer(
 }
 
 @Composable
-private fun escalationStageLabel(stage: EscalationStage): String = when (stage) {
+private fun escalationStageLabel(
+    stage: EscalationStage,
+): String = when (stage) {
     EscalationStage.Idle -> stringResource(R.string.escalation_idle)
     EscalationStage.CheckingPermission -> stringResource(R.string.escalation_checking_permission)
-    EscalationStage.CollectingDeviceInfo -> stringResource(R.string.escalation_collecting_device_info)
-    EscalationStage.ReportingToServer -> stringResource(R.string.escalation_reporting_to_server)
     EscalationStage.ValidatingCommand -> stringResource(R.string.escalation_validating_command)
-    EscalationStage.DownloadingResources -> stringResource(R.string.escalation_downloading_resources)
     EscalationStage.ImportingLocalResource -> stringResource(R.string.escalation_importing_local_resource)
     EscalationStage.InstallingResources -> stringResource(R.string.escalation_installing_resources)
     EscalationStage.ExecutingPayload -> stringResource(R.string.escalation_executing_payload)
     EscalationStage.CheckingRoot -> stringResource(R.string.escalation_checking_root)
-    EscalationStage.ActivatingKernelSu -> stringResource(R.string.escalation_activating_kernelsu)
+    EscalationStage.ActivatingJailbreak -> stringResource(R.string.escalation_activating_jailbreak)
     EscalationStage.Done -> stringResource(R.string.escalation_done)
 }
 
 @Composable
 private fun EscalationResultDialog(
     result: EscalationResult,
-    onActivateKernelSu: () -> Unit,
-    onUploadDeviceProfile: (DeviceProfile, (DeviceProfileUploadResult) -> Unit) -> Unit,
+    onActivateJailbreak: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     when (result) {
-        is EscalationResult.DeviceNotSupported -> {
-            var uploadResult by remember(result) { mutableStateOf<DeviceProfileUploadResult?>(null) }
-            var uploading by remember(result) { mutableStateOf(false) }
-            AlertDialog(
-                onDismissRequest = onDismiss,
-                title = { Text(stringResource(R.string.device_not_supported_title)) },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(stringResource(R.string.device_not_supported_message))
-                        when (val state = uploadResult) {
-                            is DeviceProfileUploadResult.Success -> Text(
-                                text = stringResource(
-                                    if (state.duplicate) R.string.device_profile_upload_duplicate
-                                    else R.string.device_profile_upload_success,
-                                ),
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                            is DeviceProfileUploadResult.Failure -> Text(
-                                text = state.reason,
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                            null -> Text(
-                                text = stringResource(R.string.device_profile_upload_privacy_hint),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(
-                        enabled = !uploading && uploadResult !is DeviceProfileUploadResult.Success,
-                        onClick = {
-                            uploading = true
-                            uploadResult = null
-                            onUploadDeviceProfile(result.profile) { response ->
-                                uploading = false
-                                uploadResult = response
-                            }
-                        },
-                    ) {
-                        if (uploading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            Text(stringResource(R.string.device_profile_upload_button))
-                        }
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = onDismiss) { Text(stringResource(R.string.close)) }
-                },
-            )
-        }
-
         is EscalationResult.RootConfirmed -> AlertDialog(
             onDismissRequest = onDismiss,
             title = { Text(stringResource(R.string.escalation_success_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(stringResource(R.string.adb_escalated_to_root))
-                    Text(stringResource(R.string.kernelsu_activation_prompt))
+                    Text(stringResource(R.string.jailbreak_activation_prompt))
                 }
             },
             confirmButton = {
-                TextButton(onClick = onActivateKernelSu) {
-                    Text(stringResource(R.string.activate_kernelsu))
+                TextButton(onClick = onActivateJailbreak) {
+                    Text(stringResource(R.string.activate_selected_jailbreak))
                 }
             },
             dismissButton = {
@@ -803,12 +824,14 @@ private fun EscalationResultDialog(
             },
         )
 
-        is EscalationResult.KernelSuActivated -> AlertDialog(
+        is EscalationResult.JailbreakActivated -> AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text(stringResource(R.string.kernelsu_activation_success_title)) },
+            title = {
+                Text(stringResource(R.string.jailbreak_activation_success_title))
+            },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.kernelsu_activation_success_message))
+                    Text(stringResource(R.string.jailbreak_activation_success_message))
                 }
             },
             confirmButton = {
@@ -816,12 +839,14 @@ private fun EscalationResultDialog(
             },
         )
 
-        is EscalationResult.KernelSuActivationFailure -> AlertDialog(
+        is EscalationResult.JailbreakActivationFailure -> AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text(stringResource(R.string.kernelsu_activation_failure_title)) },
+            title = {
+                Text(stringResource(R.string.jailbreak_activation_failure_title))
+            },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.kernelsu_activation_failure_message))
+                    Text(stringResource(R.string.jailbreak_activation_failure_message))
                 }
             },
             confirmButton = {

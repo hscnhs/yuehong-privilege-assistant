@@ -48,8 +48,7 @@ android {
 
     packagingOptions {
         jniLibs {
-            keepDebugSymbols += ["**/libbs.so", "**/libionstack.so", "**/libcve43499root.so"]
-            keepDebugSymbols += ["**/libbs.so", "**/libionstack.so", "**/libcve43499root.so", "**/libghostlock.so", "**/libextract.so"]
+            keepDebugSymbols += ["**/libbs.so", "**/libionstack.so", "**/libghostlock.so", "**/libextract.so", "**/libksu_*.so"]
         }
     }
 
