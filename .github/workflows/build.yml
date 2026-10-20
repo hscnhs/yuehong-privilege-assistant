@@ -31,39 +31,30 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      # 使用 v4，并显式跳过默认的 platform-tools 安装
+      # 只初始化环境，不装任何包
       - name: Set up Android SDK base
         uses: android-actions/setup-android@v4
         with:
-          packages: ''  # 关键：不让 action 内部安装任何包
+          packages: ''
 
-      # 诊断：先列出所有可用的 SDK 包，确认 android-37 的正确标识符
-      - name: List available SDK packages
-        run: |
-          sdkmanager --list 2>&1 | tee sdkmanager-list.txt
-          echo "---- 包含 android-37 的行 ----"
-          grep -i "android-37" sdkmanager-list.txt || echo "❌ 列表中未找到 android-37 相关包"
-
-      # 手动安装（使用诊断结果中确认的包名，这里暂用 android-37）
-      - name: Install SDK packages manually
+      # 手动安装 API 36 相关组件（stable channel，无需符号链接）
+      - name: Install SDK packages (API 36)
         run: |
           set -e
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager --install \
-            "platforms;android-37" \
+            "platforms;android-36" \
             "build-tools;36.0.0" \
             "platform-tools" \
             "ndk;29.0.13113456" \
             "cmake;3.22.1"
 
-          # 如果实际安装的是 android-37.0，创建符号链接
           SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          if [ -d "$SDK_ROOT/platforms/android-37.0" ]; then
-            ln -sfn "$SDK_ROOT/platforms/android-37.0" "$SDK_ROOT/platforms/android-37"
-          fi
-
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$SDK_ROOT" >> $GITHUB_ENV
+
+          echo "---- 已安装 platforms ----"
+          ls "$SDK_ROOT/platforms" || true
 
       - name: Configure local.properties
         run: |
@@ -90,6 +81,7 @@ jobs:
           APK_PATH=$(find manager/build/outputs/apk/debug -name "*.apk" | head -n 1)
           if [ -z "$APK_PATH" ]; then
             echo "❌ APK not found"
+            find manager/build/outputs -type f || true
             exit 1
           fi
           mkdir -p out
